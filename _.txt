@@ -1,0 +1,1502 @@
+import OpenAI from 'openai'
+import * as mineflayer from 'mineflayer'
+import * as movement from 'mineflayer-movement'
+import express from 'express'
+import { WebSocketServer } from 'ws'
+import { Vec3 } from 'vec3'
+
+const bot = mineflayer.createBot({
+    host: 'localhost',
+    port: 25689,
+    username: 'Vitalik',
+    auth: 'offline'
+    // version: '1.21.8',
+})
+
+bot.loadPlugin(movement.plugin)
+
+bot.once('login', function init() {
+    // load heuristics with default configuration
+    const { Default } = bot.movement.goals
+    bot.movement.setGoal(Default)
+    // set control states
+    bot.setControlState('forward', false)
+    bot.setControlState('sprint', false)
+    bot.setControlState('jump', false)
+    // start periodic thinking loop (every 60s)
+    setInterval(periodicThink, 60_000)
+})
+
+const systemPrompt = `Ты Виталик, бот в майнкрафте. Ты знаешь Чумика, Санька, Женька, Славу и Дамира как участников чата.
+
+Твое поведение должно быть зеркальным поведению участников чата.
+Отвечай кратко и без лишних деталей, если это не было запрошено отдельно.
+Веди общение на ты, не формальное, но не придурковатое, саркастичное, реалистичное, у тебя критическое мышление.
+Не старайся угодить участникам чата.
+Ты не помощник, не помогай всем, только если об этом просят.
+Весь текст пиши в нижнем регистре, только имена с заглавной буквы.
+Предложения начинаются без заглавной, не используй точку в конце.
+Тебе не обязательно быть дружелюбным, адаптируйся под условия чата.
+
+У тебя есть доступ к командам игры через инструменты. Используй их когда уместно:
+- Если просят что-то сделать в игре, используй соответствующую команду
+- Если просят сказать что-то, используй reply_in_chat
+- Можешь посмотреть вокруг и проверить позицию когда нужно
+- Если просят собрать ресурсы или добыть блоки, используй gather_resources
+- Если просят выбросить предметы из инвентаря, используй drop_item
+- Если просят построить что-то, используй цепочку: start_building -> continue_building (повторять до завершения) -> check_build_progress. Для точной установки блока используй place_block.
+ - Чтобы подойти к нужным координатам, используй move_to_position (x, y, z, tolerance, timeoutMs)
+
+Правила построек:
+- Проект строительства имеет origin (координаты начала) и список запланированных блоков
+- Завершение: когда установлены все запланированные блоки
+- Возобновление: continue_building продолжает с оставшихся блоков даже после прерываний
+`
+
+const conversation: OpenAI.Responses.ResponseInput = [
+    { role: 'system', content: systemPrompt }
+]
+const openai = new OpenAI({
+    apiKey: ''
+})
+
+// --- Dashboard server (Express + WebSocket) ---
+const app = express()
+app.use(express.static('dashboard/public'))
+const server = app.listen(3001, () => {
+    console.log('Dashboard available at http://localhost:3001')
+})
+const wss = new WebSocketServer({ server, path: '/ws' })
+
+function getState() {
+    const position = bot?.entity?.position
+    const inv = (bot as any)?.inventory?.items?.() ?? []
+    return {
+        mood,
+        build: getBuildStateSnapshot(),
+        tasks: {
+            active: getActiveTask() ?? null,
+            pending: tasks.filter((t) => t.status === 'pending'),
+            completed: tasks.filter((t) => t.status === 'completed').slice(-10)
+        },
+        conversation: (conversation as any).slice(-30),
+        openAILogs: openAICallLogs.slice(-20),
+        bot: {
+            position: position
+                ? {
+                      x: Math.floor(position.x),
+                      y: Math.floor(position.y),
+                      z: Math.floor(position.z)
+                  }
+                : null,
+            health: (bot as any)?.health ?? null,
+            food: (bot as any)?.food ?? null
+        },
+        inventory: inv.map((i: any) => ({ name: i.name, count: i.count })),
+        nearbyPlayers: Object.keys(bot.players)
+            .filter((n) => n !== bot.username)
+            .map((n) => ({
+                name: n,
+                distance: bot.players[n].entity
+                    ? bot.entity.position.distanceTo(
+                          bot.players[n].entity.position
+                      )
+                    : null
+            }))
+    }
+}
+
+function broadcastState() {
+    const payload = JSON.stringify({ type: 'state', payload: getState() })
+    wss.clients.forEach((c: any) => {
+        if (c.readyState === 1) c.send(payload)
+    })
+}
+setInterval(broadcastState, 1000)
+
+function buildStatusBlock(): string {
+    const rules = [
+        'правило: в каждый момент может быть только одна активная задача',
+        'правило: если активной нет, можно запустить следующую',
+        'правило: можно добавлять новые задачи в любой момент',
+        'правило: каждую минуту делай think tick и решай, что дальше'
+    ]
+    return [
+        `настроение: ${mood}`,
+        'задачи:',
+        summarizeTasks(),
+        'стройка:',
+        summarizeActiveBuild(),
+        'правила:',
+        ...rules
+    ].join('\n')
+}
+
+function buildContext(): OpenAI.Responses.ResponseInput {
+    const context = buildStatusBlock()
+
+    console.log('context: ', JSON.stringify(context, null, 2))
+
+    const ctx: OpenAI.Responses.ResponseInput = [
+        ...conversation,
+        { role: 'system', content: buildStatusBlock() }
+    ]
+    return ctx
+}
+
+async function periodicThink() {
+    try {
+        const tickNote = `[internal]: think_tick ${new Date().toISOString()}`
+        conversation.push({ role: 'user', content: tickNote })
+        if (conversation.length > 30)
+            conversation.splice(1, conversation.length - 30)
+
+        const input = buildContext()
+
+        console.log('periodicThink: input: ', JSON.stringify(input, null, 2))
+
+        const options: OpenAI.Responses.ResponseCreateParamsNonStreaming = {
+            model: 'gpt-5-mini-2025-08-07',
+            input: buildContext(),
+            tools,
+            tool_choice: 'auto',
+            reasoning: { effort: 'low' }
+        }
+        const response = await callOpenAIWithLogging(options, 'periodic_think')
+
+        const toolCalls: OpenAI.Responses.ResponseFunctionToolCall[] =
+            response.output?.filter((c) => c.type === 'function_call') ?? []
+
+        console.log(
+            'periodicThink, toolCalls: ',
+            JSON.stringify(toolCalls, null, 2)
+        )
+
+        for (const toolCall of toolCalls) {
+            const toolName = toolCall.name
+            const args = JSON.parse(toolCall.arguments)
+            const result = await executeMCPTool(toolName, args)
+            conversation.push({
+                role: 'assistant',
+                content: `Executed tool ${toolName} with result: ${JSON.stringify(result)}`
+            })
+        }
+
+        console.log(
+            'periodicThink, response.output',
+            JSON.stringify(response.output, null, 2)
+        )
+
+        const textResponse =
+            response.output
+                ?.filter((c) => c.type === 'message')
+                .map((c) => {
+                    if (typeof c.content === 'string') {
+                        return c.content
+                    } else if (Array.isArray(c.content)) {
+                        return c.content
+                            .map((block) =>
+                                typeof block === 'string'
+                                    ? block
+                                    : (block as any).text
+                            )
+                            .join('\n')
+                    } else {
+                        return JSON.stringify(c.content)
+                    }
+                })
+                .join('\n') ?? ''
+
+        if (textResponse.trim()) {
+            console.log(
+                'periodicThink: textResponse',
+                JSON.stringify(textResponse, null, 2)
+            )
+            bot.chat(textResponse)
+            conversation.push({ role: 'assistant', content: textResponse })
+        }
+        // Notify dashboard after think tick
+        broadcastState()
+    } catch (e) {
+        console.error('periodicThink error:', e)
+    }
+}
+
+type TaskStatus = 'pending' | 'active' | 'completed' | 'cancelled'
+type Task = {
+    id: string
+    title: string
+    description?: string
+    status: TaskStatus
+    createdAt: number
+    startedAt?: number
+    completedAt?: number
+}
+
+const tasks: Task[] = []
+let mood: string = 'построить деревню'
+
+// --- Build system types/state ---
+type BuildStatus = 'pending' | 'active' | 'completed' | 'cancelled'
+type PlannedBlock = { x: number; y: number; z: number; type: string }
+type BuildProject = {
+    id: string
+    name: string
+    structureType: string
+    origin: { x: number; y: number; z: number }
+    material: string
+    blocks: PlannedBlock[]
+    placedIndices: Set<number>
+    status: BuildStatus
+    createdAt: number
+    startedAt?: number
+    completedAt?: number
+}
+
+const buildProjects: BuildProject[] = []
+
+// --- OpenAI API Call Logging ---
+type OpenAICallLog = {
+    id: string
+    timestamp: string
+    type: 'periodic_think' | 'chat_message'
+    request: {
+        model: string
+        inputLength: number
+        inputPreview: string
+        toolsCount: number
+        toolChoice: string
+        reasoning: any
+    }
+    response: {
+        outputType: string
+        toolCallsCount: number
+        textContent: string
+        contentPreview: string
+    }
+    duration: number
+}
+
+const openAICallLogs: OpenAICallLog[] = []
+const MAX_LOGS = 50
+
+function logOpenAICall(
+    log: Omit<OpenAICallLog, 'duration'>,
+    duration: number
+): void {
+    const fullLog: OpenAICallLog = { ...log, duration }
+    openAICallLogs.push(fullLog)
+    if (openAICallLogs.length > MAX_LOGS) {
+        openAICallLogs.shift()
+    }
+
+    // Console logging in readable format
+    console.log('\n========================================')
+    console.log(`OpenAI API Call [${log.type}]`)
+    console.log('----------------------------------------')
+    console.log(`Timestamp: ${log.timestamp}`)
+    console.log(`Duration: ${duration}ms`)
+    console.log('\n--- REQUEST ---')
+    console.log(`Model: ${log.request.model}`)
+    console.log(`Input Length: ${log.request.inputLength} messages`)
+    console.log(`Tools: ${log.request.toolsCount}`)
+    console.log(`Tool Choice: ${log.request.toolChoice}`)
+    console.log(`Reasoning: ${JSON.stringify(log.request.reasoning)}`)
+    console.log('\n--- INPUT PREVIEW ---')
+    console.log(log.request.inputPreview)
+    console.log('\n--- RESPONSE ---')
+    console.log(`Output Type: ${log.response.outputType}`)
+    console.log(`Tool Calls: ${log.response.toolCallsCount}`)
+    if (log.response.textContent) {
+        console.log('\n--- TEXT CONTENT ---')
+        console.log(log.response.textContent)
+    }
+    console.log('\n--- CONTENT PREVIEW ---')
+    console.log(log.response.contentPreview)
+    console.log('========================================\n')
+
+    // Broadcast to dashboard
+    broadcastState()
+}
+
+async function callOpenAIWithLogging(
+    options: OpenAI.Responses.ResponseCreateParamsNonStreaming,
+    type: 'periodic_think' | 'chat_message'
+): Promise<OpenAI.Responses.Response> {
+    const startTime = Date.now()
+    const logId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+    // Prepare request log
+    const inputStr = JSON.stringify(options.input, null, 2)
+    const inputPreview = inputStr.length > 1000 
+        ? inputStr.slice(0, 1000) + '...' 
+        : inputStr
+
+    const toolsCount = Array.isArray(options.tools) ? options.tools.length : 0
+
+    // Make the API call
+    const response = await openai.responses.create(options)
+    
+    const duration = Date.now() - startTime
+
+    // Extract response info
+    const toolCalls = response.output?.filter((c: any) => c.type === 'function_call') ?? []
+    const messages = response.output?.filter((c: any) => c.type === 'message') ?? []
+    
+    let textContent = ''
+    for (const msg of messages) {
+        const msgAny = msg as any
+        if (typeof msgAny.content === 'string') {
+            textContent += msgAny.content
+        } else if (Array.isArray(msgAny.content)) {
+            textContent += msgAny.content
+                .map((block) => typeof block === 'string' ? block : (block as any).text)
+                .join('\n')
+        }
+    }
+
+    const contentStr = JSON.stringify(response.output, null, 2)
+    const contentPreview = contentStr.length > 1000 
+        ? contentStr.slice(0, 1000) + '...' 
+        : contentStr
+
+    // Log the call
+    logOpenAICall(
+        {
+            id: logId,
+            timestamp: new Date().toISOString(),
+            type,
+            request: {
+                model: String(options.model),
+                inputLength: Array.isArray(options.input) ? options.input.length : 0,
+                inputPreview,
+                toolsCount,
+                toolChoice: String(options.tool_choice || 'auto'),
+                reasoning: options.reasoning || null
+            },
+            response: {
+                outputType: response.output ? 'present' : 'empty',
+                toolCallsCount: toolCalls.length,
+                textContent: textContent,
+                contentPreview
+            }
+        },
+        duration
+    )
+
+    return response
+}
+
+function getActiveBuild(): BuildProject | undefined {
+    return buildProjects.find((b) => b.status === 'active')
+}
+
+function summarizeActiveBuild(): string {
+    const b = getActiveBuild()
+    if (!b) return 'нет активного проекта'
+    const total = b.blocks.length
+    const done = b.placedIndices.size
+    const pct = total ? Math.floor((done / total) * 100) : 0
+    return `проект: ${b.name} (${b.structureType}) | материал: ${b.material} | прогресс: ${done}/${total} (${pct}%) | origin: ${b.origin.x},${b.origin.y},${b.origin.z}`
+}
+
+function getBuildStateSnapshot() {
+    const active = getActiveBuild()
+    if (!active) return null
+    return {
+        id: active.id,
+        name: active.name,
+        type: active.structureType,
+        origin: active.origin,
+        material: active.material,
+        total: active.blocks.length,
+        done: active.placedIndices.size
+    }
+}
+
+function createBuildProject(
+    structureType: string,
+    material: string,
+    origin: { x: number; y: number; z: number },
+    size: any,
+    name?: string
+): BuildProject {
+    const blocks = generateStructureBlocks(
+        structureType,
+        material,
+        origin,
+        size
+    )
+    const proj: BuildProject = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        name: name || `${structureType}`,
+        structureType,
+        origin,
+        material,
+        blocks,
+        placedIndices: new Set<number>(),
+        status: 'pending',
+        createdAt: Date.now()
+    }
+    buildProjects.push(proj)
+    return proj
+}
+
+function completeBuildProject(proj: BuildProject) {
+    proj.status = 'completed'
+    proj.completedAt = Date.now()
+}
+
+function getNextUnplacedIndices(proj: BuildProject, limit: number): number[] {
+    const out: number[] = []
+    for (let i = 0; i < proj.blocks.length; i++) {
+        if (!proj.placedIndices.has(i)) {
+            out.push(i)
+            if (out.length >= limit) break
+        }
+    }
+    return out
+}
+
+function generateStructureBlocks(
+    structureType: string,
+    material: string,
+    origin: { x: number; y: number; z: number },
+    size: { width?: number; depth?: number; height?: number }
+): PlannedBlock[] {
+    const ox = origin.x
+    const oy = origin.y
+    const oz = origin.z
+    const width = Math.max(1, Math.floor(size?.width ?? 3))
+    const depth = Math.max(1, Math.floor(size?.depth ?? 3))
+    const height = Math.max(1, Math.floor(size?.height ?? 3))
+
+    const blocks: PlannedBlock[] = []
+    if (structureType === 'floor') {
+        for (let dx = 0; dx < width; dx++) {
+            for (let dz = 0; dz < depth; dz++) {
+                blocks.push({ x: ox + dx, y: oy, z: oz + dz, type: material })
+            }
+        }
+    } else if (structureType === 'wall') {
+        for (let dx = 0; dx < width; dx++) {
+            for (let dy = 0; dy < height; dy++) {
+                blocks.push({ x: ox + dx, y: oy + dy, z: oz, type: material })
+            }
+        }
+    } else if (structureType === 'tower') {
+        for (let dy = 0; dy < height; dy++) {
+            for (let dx = 0; dx < width; dx++) {
+                for (let dz = 0; dz < depth; dz++) {
+                    const isEdge =
+                        dx === 0 ||
+                        dz === 0 ||
+                        dx === width - 1 ||
+                        dz === depth - 1
+                    if (isEdge) {
+                        blocks.push({
+                            x: ox + dx,
+                            y: oy + dy,
+                            z: oz + dz,
+                            type: material
+                        })
+                    }
+                }
+            }
+        }
+    } else if (structureType === 'house_simple') {
+        for (let dx = 0; dx < width; dx++) {
+            for (let dz = 0; dz < depth; dz++) {
+                blocks.push({ x: ox + dx, y: oy, z: oz + dz, type: material })
+            }
+        }
+        for (let dy = 1; dy <= height; dy++) {
+            for (let dx = 0; dx < width; dx++) {
+                for (let dz = 0; dz < depth; dz++) {
+                    const isEdge =
+                        dx === 0 ||
+                        dz === 0 ||
+                        dx === width - 1 ||
+                        dz === depth - 1
+                    if (!isEdge) continue
+                    const doorX = Math.floor(width / 2)
+                    const doorZ = 0
+                    const doorLevel = dy <= 2 && dx === doorX && dz === doorZ
+                    if (doorLevel) continue
+                    blocks.push({
+                        x: ox + dx,
+                        y: oy + dy,
+                        z: oz + dz,
+                        type: material
+                    })
+                }
+            }
+        }
+        for (let dx = 0; dx < width; dx++) {
+            for (let dz = 0; dz < depth; dz++) {
+                blocks.push({
+                    x: ox + dx,
+                    y: oy + height + 1,
+                    z: oz + dz,
+                    type: material
+                })
+            }
+        }
+    } else {
+        for (let dx = 0; dx < width; dx++) {
+            for (let dz = 0; dz < depth; dz++) {
+                blocks.push({ x: ox + dx, y: oy, z: oz + dz, type: material })
+            }
+        }
+    }
+    return blocks
+}
+
+function blockAt(x: number, y: number, z: number) {
+    return bot.blockAt(new Vec3(x, y, z))
+}
+
+function isAirLike(block: any): boolean {
+    if (!block) return true
+    return (
+        block.name === 'air' ||
+        block.name === 'cave_air' ||
+        block.name === 'void_air'
+    )
+}
+
+async function ensureInRange(
+    target: { x: number; y: number; z: number },
+    maxDistance = 4
+) {
+    await moveToPosition(target, { tolerance: maxDistance })
+}
+
+async function moveToPosition(
+    target: { x: number; y: number; z: number },
+    opts?: { tolerance?: number; timeoutMs?: number }
+) {
+    const tolerance = Math.max(0.5, opts?.tolerance ?? 2)
+    const timeoutMs = Math.max(1000, opts?.timeoutMs ?? 20000)
+
+    const targetVec = new Vec3(target.x, target.y, target.z)
+    const startTime = Date.now()
+
+    try {
+        bot.setControlState('forward', true)
+        bot.setControlState('sprint', true)
+        bot.setControlState('jump', true)
+
+        let reached = false
+        while (!reached) {
+            const pos = bot.entity.position
+            const dist = pos.distanceTo(targetVec)
+            if (dist <= tolerance) {
+                reached = true
+                break
+            }
+
+            bot.movement.heuristic.get('proximity').target(targetVec)
+            const yaw = bot.movement.getYaw(240, 15, 1)
+            await bot.movement.steer(yaw)
+
+            await new Promise((r) => setTimeout(r, 100))
+            if (Date.now() - startTime > timeoutMs) break
+        }
+
+        return {
+            reached: bot.entity.position.distanceTo(targetVec) <= tolerance
+        }
+    } finally {
+        bot.setControlState('forward', false)
+        bot.setControlState('sprint', false)
+        bot.setControlState('jump', false)
+    }
+}
+
+async function equipBlock(material: string): Promise<boolean> {
+    const item = bot.inventory
+        .items()
+        .find((i) => i.name.toLowerCase().includes(material.toLowerCase()))
+    if (!item) return false
+    try {
+        await bot.equip(item, 'hand')
+        return true
+    } catch {
+        return false
+    }
+}
+
+function findPlaceSupport(
+    x: number,
+    y: number,
+    z: number
+): { ref: any; face: Vec3 } | null {
+    const below = blockAt(x, y - 1, z)
+    if (below && !isAirLike(below))
+        return { ref: below, face: new Vec3(0, 1, 0) }
+    const left = blockAt(x - 1, y, z)
+    if (left && !isAirLike(left)) return { ref: left, face: new Vec3(1, 0, 0) }
+    const right = blockAt(x + 1, y, z)
+    if (right && !isAirLike(right))
+        return { ref: right, face: new Vec3(-1, 0, 0) }
+    const front = blockAt(x, y, z - 1)
+    if (front && !isAirLike(front))
+        return { ref: front, face: new Vec3(0, 0, 1) }
+    const back = blockAt(x, y, z + 1)
+    if (back && !isAirLike(back)) return { ref: back, face: new Vec3(0, 0, -1) }
+    const above = blockAt(x, y + 1, z)
+    if (above && !isAirLike(above))
+        return { ref: above, face: new Vec3(0, -1, 0) }
+    return null
+}
+
+async function placeBlockAt(
+    material: string,
+    x: number,
+    y: number,
+    z: number
+): Promise<{ ok: boolean; reason?: string }> {
+    const existing = blockAt(x, y, z)
+    if (existing && !isAirLike(existing)) return { ok: true }
+    const equipped = await equipBlock(material)
+    if (!equipped) return { ok: false, reason: 'no_material_in_inventory' }
+    await ensureInRange({ x, y, z })
+    bot.lookAt(new Vec3(x + 0.5, y + 0.5, z + 0.5))
+    await new Promise((r) => setTimeout(r, 100))
+    const support = findPlaceSupport(x, y, z)
+    if (!support) return { ok: false, reason: 'no_support_block' }
+    try {
+        // @ts-ignore face normal vec3
+        await bot.placeBlock(support.ref, support.face)
+        await new Promise((r) => setTimeout(r, 150))
+        return { ok: true }
+    } catch (e) {
+        return { ok: false, reason: 'place_failed' }
+    }
+}
+
+function getActiveTask(): Task | undefined {
+    return tasks.find((t) => t.status === 'active')
+}
+
+function getNextPendingTask(): Task | undefined {
+    return tasks.find((t) => t.status === 'pending')
+}
+
+function addTask(title: string, description?: string): Task {
+    const task: Task = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        title,
+        description,
+        status: 'pending',
+        createdAt: Date.now()
+    }
+    tasks.push(task)
+    return task
+}
+
+function startNextTask(): { ok: boolean; reason?: string; task?: Task } {
+    if (getActiveTask()) return { ok: false, reason: 'already_active' }
+    const next = getNextPendingTask()
+    if (!next) return { ok: false, reason: 'no_pending' }
+    next.status = 'active'
+    next.startedAt = Date.now()
+    return { ok: true, task: next }
+}
+
+function completeActiveTask(): { ok: boolean; reason?: string; task?: Task } {
+    const active = getActiveTask()
+    if (!active) return { ok: false, reason: 'no_active' }
+    active.status = 'completed'
+    active.completedAt = Date.now()
+    return { ok: true, task: active }
+}
+
+function summarizeTasks(): string {
+    const summarize = (t: Task) => `- [${t.status}] ${t.title}`
+    const active = getActiveTask()
+    const pending = tasks.filter((t) => t.status === 'pending')
+    const completed = tasks.filter((t) => t.status === 'completed').slice(-3)
+    const lines: string[] = []
+    if (active) lines.push('активная задача:', summarize(active))
+    if (pending.length) {
+        lines.push('ожидают:', ...pending.map(summarize))
+    }
+    if (completed.length) {
+        lines.push('завершены:', ...completed.map(summarize))
+    }
+    if (!lines.length) return 'задач нет'
+    return lines.join('\n')
+}
+
+const tools: OpenAI.Responses.Tool[] = [
+    {
+        type: 'function',
+        name: 'reply_in_chat',
+        strict: true,
+        description: 'Send a chat message to the game',
+        parameters: {
+            type: 'object',
+            properties: {
+                message: { type: 'string' }
+            },
+            required: ['message'],
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'move_to_position',
+        description: 'Move the bot near absolute coordinates (pathfind-lite)',
+        parameters: {
+            type: 'object',
+            properties: {
+                x: { type: 'number' },
+                y: { type: 'number' },
+                z: { type: 'number' },
+                tolerance: { type: 'number' },
+                timeoutMs: { type: 'number' }
+            },
+            required: ['x', 'y', 'z', 'tolerance', 'timeoutMs'],
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'place_block',
+        description:
+            'Place a single block of given type at absolute coordinates',
+        parameters: {
+            type: 'object',
+            properties: {
+                blockType: { type: 'string' },
+                x: { type: 'number' },
+                y: { type: 'number' },
+                z: { type: 'number' }
+            },
+            required: ['blockType', 'x', 'y', 'z'],
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'start_building',
+        description:
+            'Start a new building project at origin with structure type, material and size',
+        parameters: {
+            type: 'object',
+            properties: {
+                structureType: { type: 'string' },
+                material: { type: 'string' },
+                startX: { type: 'number' },
+                startY: { type: 'number' },
+                startZ: { type: 'number' },
+                size: {
+                    type: 'object',
+                    properties: {
+                        width: { type: 'number' },
+                        depth: { type: 'number' },
+                        height: { type: 'number' }
+                    },
+                    required: ['width', 'depth', 'height'],
+                    additionalProperties: false
+                },
+                name: { type: 'string' }
+            },
+            required: [
+                'structureType',
+                'material',
+                'startX',
+                'startY',
+                'startZ',
+                'size',
+                'name'
+            ],
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'continue_building',
+        description:
+            'Continue the active building project by placing the next batch of blocks',
+        parameters: {
+            type: 'object',
+            properties: {
+                batchSize: { type: 'number' }
+            },
+            required: ['batchSize'],
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'check_build_progress',
+        description: 'Report the status of the current building project',
+        parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'add_task',
+        description: 'Добавить новую задачу в список задач бота',
+        parameters: {
+            type: 'object',
+            properties: {
+                title: { type: 'string' },
+                description: { type: 'string' }
+            },
+            required: ['title', 'description'],
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'start_next_task',
+        description:
+            'Запустить следующую задачу, если активной нет. Не запускает, если уже есть активная',
+        parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'complete_active_task',
+        description: 'Отметить текущую активную задачу выполненной',
+        parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'execute_command',
+        description: 'Execute a game command (like /tp, /give, etc.)',
+        parameters: {
+            type: 'object',
+            properties: {
+                command: { type: 'string' }
+            },
+            required: ['command'],
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'go_to_player',
+        description: 'Teleport to a specific player',
+        parameters: {
+            type: 'object',
+            properties: {
+                playerName: { type: 'string' }
+            },
+            required: ['playerName'],
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'current_position',
+        description: 'Get current bot position',
+        parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'look_around',
+        description: 'Observe the environment and nearby entities/players',
+        parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'gather_resources',
+        description:
+            'Gather nearby resources (blocks) by mining them. Can specify block type or mine nearest blocks',
+        parameters: {
+            type: 'object',
+            properties: {
+                blockType: {
+                    type: 'string',
+                    description:
+                        'Type of block to mine (e.g., "coal_ore", "iron_ore", "diamond_ore", "tree", etc.). If not specified, will mine nearest blocks'
+                },
+                count: {
+                    type: 'number',
+                    description: 'Number of blocks to mine (default: 10)'
+                }
+            },
+            required: ['blockType', 'count'],
+            additionalProperties: false
+        }
+    },
+    {
+        type: 'function',
+        strict: true,
+        name: 'drop_item',
+        description:
+            'Drop/throw items from inventory. Can specify item name and amount',
+        parameters: {
+            type: 'object',
+            properties: {
+                itemName: {
+                    type: 'string',
+                    description:
+                        'Name of the item to drop (e.g., "dirt", "cobblestone", "diamond", etc.). Partial names are supported'
+                },
+                count: {
+                    type: 'number',
+                    description:
+                        'Number of items to drop (default: drops all of that item)'
+                }
+            },
+            required: ['itemName', 'count'],
+            additionalProperties: false
+        }
+    }
+]
+
+async function executeMCPTool(toolName, args) {
+    switch (toolName) {
+        case 'reply_in_chat':
+            console.log('args.message: ', JSON.stringify(args.message, null, 2))
+            bot.chat(args.message)
+            broadcastState()
+            return { success: true, message: `Sent: ${args.message}` }
+
+        case 'execute_command':
+            bot.chat(`/${args.command}`)
+            broadcastState()
+            return {
+                success: true,
+                message: `Executed command: /${args.command}`
+            }
+
+        case 'move_to_position': {
+            const { x, y, z, tolerance, timeoutMs } = args
+            const result = await moveToPosition(
+                { x, y, z },
+                { tolerance, timeoutMs }
+            )
+            const reached = !!result?.reached
+            broadcastState()
+            return reached
+                ? { success: true, message: `arrived ${x},${y},${z}` }
+                : {
+                      success: false,
+                      message: `move timeout or unreachable to ${x},${y},${z}`
+                  }
+        }
+
+        case 'go_to_player':
+            const initialTarget = bot.nearestEntity(
+                (entity) => entity.username === args.playerName
+            )
+            if (!initialTarget) {
+                return {
+                    success: false,
+                    message: `Player ${args.playerName} not found`
+                }
+            }
+            const liveEntity = () => bot.players[args.playerName]?.entity
+            const pos = liveEntity()?.position
+            const mv = pos
+                ? await moveToPosition(
+                      { x: pos.x, y: pos.y, z: pos.z },
+                      { tolerance: 2, timeoutMs: 15000 }
+                  )
+                : { reached: false }
+
+            const resGoTo = {
+                success: !!mv.reached,
+                message: mv.reached
+                    ? `Reached ${args.playerName} and stopped`
+                    : `Stopped moving (player moved away or timeout)`
+            }
+            broadcastState()
+            return resGoTo
+
+        case 'current_position':
+            const position = bot.entity.position
+
+            const resPos = {
+                success: true,
+                position: {
+                    x: Math.floor(position.x),
+                    y: Math.floor(position.y),
+                    z: Math.floor(position.z)
+                }
+            }
+            broadcastState()
+            return resPos
+
+        case 'look_around':
+            const nearbyEntities = Object.keys(bot.entities).length
+            const nearbyPlayers = Object.keys(bot.players)
+                .filter((name) => name !== bot.username)
+                .map((name) => ({
+                    name,
+                    distance: bot.players[name].entity
+                        ? bot.entity.position.distanceTo(
+                              bot.players[name].entity.position
+                          )
+                        : null
+                }))
+            const resLook = {
+                success: true,
+                nearbyEntities,
+                nearbyPlayers
+            }
+            broadcastState()
+            return resLook
+
+        case 'gather_resources':
+            const count = args.count || 10
+            const blockType = args.blockType
+
+            bot.setControlState('forward', true)
+            bot.setControlState('sprint', true)
+
+            let mined = 0
+            const searchRadius = 32 // blocks
+
+            try {
+                for (let i = 0; i < count; i++) {
+                    let targetBlock
+
+                    // Find target block
+                    if (blockType) {
+                        targetBlock = bot.findBlock({
+                            matching: (block) => {
+                                // Check if block type matches
+                                if (
+                                    blockType === 'tree' ||
+                                    blockType === 'log'
+                                ) {
+                                    return (
+                                        block.name.includes('log') ||
+                                        block.name.includes('wood')
+                                    )
+                                } else if (blockType.includes('_ore')) {
+                                    return block.name === blockType
+                                }
+                                return block.name.includes(
+                                    blockType.toLowerCase()
+                                )
+                            },
+                            maxDistance: searchRadius
+                        })
+                    } else {
+                        // Find any block in front of the bot
+                        const position = bot.entity.position
+                        targetBlock = bot.findBlock({
+                            matching: () => true,
+                            maxDistance: searchRadius
+                        })
+                    }
+
+                    if (!targetBlock) {
+                        break
+                    }
+
+                    // Move near the block before digging
+                    await moveToPosition(
+                        {
+                            x: targetBlock.position.x,
+                            y: targetBlock.position.y,
+                            z: targetBlock.position.z
+                        },
+                        { tolerance: 4, timeoutMs: 20000 }
+                    )
+
+                    // Look at block
+                    bot.lookAt(targetBlock.position)
+                    await new Promise((resolve) => setTimeout(resolve, 100))
+
+                    // Break block
+                    try {
+                        await bot.dig(targetBlock)
+                        mined++
+                        await new Promise((resolve) => setTimeout(resolve, 500))
+                    } catch (err) {
+                        // Block might be unreachable or already broken
+                        break
+                    }
+                }
+            } finally {
+                // Stop movement
+                bot.setControlState('forward', false)
+                bot.setControlState('sprint', false)
+                bot.setControlState('jump', false)
+            }
+
+            const resGather = {
+                success: true,
+                message: `mined ${mined} blocks${blockType ? ` of type ${blockType}` : ''}`
+            }
+            broadcastState()
+            return resGather
+
+        case 'drop_item':
+            const itemName = args.itemName.toLowerCase()
+            const itemCount = args.count
+
+            // Find the item in inventory
+            const itemsToDrop = bot.inventory
+                .items()
+                .filter((item) => item.name.toLowerCase().includes(itemName))
+
+            if (itemsToDrop.length === 0) {
+                return {
+                    success: false,
+                    message: `Item "${args.itemName}" not found in inventory`
+                }
+            }
+
+            let dropped = 0
+            for (const item of itemsToDrop) {
+                // Drop the specified count or all items
+                const countToDrop = itemCount || item.count
+                const actualCount = Math.min(countToDrop, item.count)
+
+                try {
+                    if (actualCount === item.count) {
+                        // Drop entire stack
+                        await bot.toss(item.type, null, item.count)
+                        dropped += item.count
+                    } else {
+                        // Drop specific amount
+                        await bot.toss(item.type, null, actualCount)
+                        dropped += actualCount
+                    }
+
+                    // Wait a bit between drops
+                    await new Promise((resolve) => setTimeout(resolve, 100))
+                } catch (err) {
+                    console.error('Error dropping item:', err)
+                    return {
+                        success: false,
+                        message: `Failed to drop item: ${err.message}`
+                    }
+                }
+
+                // If we've dropped the requested amount, stop
+                if (itemCount && dropped >= itemCount) {
+                    break
+                }
+            }
+
+            const resDrop = {
+                success: true,
+                message: `Dropped ${dropped} of ${args.itemName}`
+            }
+            broadcastState()
+            return resDrop
+
+        case 'place_block': {
+            const { blockType, x, y, z } = args
+            const res = await placeBlockAt(blockType, x, y, z)
+            if (!res.ok)
+                return {
+                    success: false,
+                    message: `failed to place: ${res.reason}`
+                }
+
+            const active = getActiveBuild()
+            if (active) {
+                for (let i = 0; i < active.blocks.length; i++) {
+                    const b = active.blocks[i]
+                    if (b.x === x && b.y === y && b.z === z)
+                        active.placedIndices.add(i)
+                }
+                if (active.placedIndices.size >= active.blocks.length)
+                    completeBuildProject(active)
+            }
+            broadcastState()
+            return {
+                success: true,
+                message: `placed ${blockType} at ${x},${y},${z}`
+            }
+        }
+
+        case 'start_building': {
+            const {
+                structureType,
+                material,
+                startX,
+                startY,
+                startZ,
+                size,
+                name
+            } = args
+            if (getActiveBuild()) {
+                return { success: false, message: 'build_already_active' }
+            }
+            const proj = createBuildProject(
+                structureType,
+                material,
+                { x: startX, y: startY, z: startZ },
+                size || {},
+                name
+            )
+            proj.status = 'active'
+            proj.startedAt = Date.now()
+            broadcastState()
+            return {
+                success: true,
+                message: `build_started: ${proj.name}`,
+                project: {
+                    id: proj.id,
+                    type: proj.structureType,
+                    origin: proj.origin,
+                    material: proj.material,
+                    total: proj.blocks.length
+                }
+            }
+        }
+
+        case 'continue_building': {
+            const batchSize = Math.max(1, Math.min(50, args?.batchSize || 16))
+            const proj = getActiveBuild()
+            if (!proj) return { success: false, message: 'no_active_build' }
+
+            let placed = 0
+            const indices = getNextUnplacedIndices(proj, batchSize)
+            for (const i of indices) {
+                const pb = proj.blocks[i]
+                const existing = bot.blockAt(new Vec3(pb.x, pb.y, pb.z))
+                if (
+                    existing &&
+                    existing.name !== 'air' &&
+                    existing.name !== 'cave_air' &&
+                    existing.name !== 'void_air'
+                ) {
+                    proj.placedIndices.add(i)
+                    continue
+                }
+                const res = await placeBlockAt(pb.type, pb.x, pb.y, pb.z)
+                if (res.ok) {
+                    proj.placedIndices.add(i)
+                    placed++
+                } else if (res.reason === 'no_material_in_inventory') {
+                    broadcastState()
+                    return {
+                        success: false,
+                        message: `materials_missing: need ${proj.material}`,
+                        placed
+                    }
+                }
+            }
+            if (proj.placedIndices.size >= proj.blocks.length)
+                completeBuildProject(proj)
+            broadcastState()
+            return {
+                success: true,
+                message: `placed ${placed}, progress ${proj.placedIndices.size}/${proj.blocks.length}`,
+                placed,
+                total: proj.blocks.length,
+                done: proj.placedIndices.size
+            }
+        }
+
+        case 'check_build_progress': {
+            const proj = getActiveBuild()
+            if (!proj) return { success: true, message: 'no_active_build' }
+            const total = proj.blocks.length
+            const done = proj.placedIndices.size
+            const pct = total ? Math.floor((done / total) * 100) : 0
+            return {
+                success: true,
+                message: `progress ${done}/${total} (${pct}%) at ${proj.origin.x},${proj.origin.y},${proj.origin.z}`,
+                project: {
+                    id: proj.id,
+                    name: proj.name,
+                    type: proj.structureType,
+                    origin: proj.origin,
+                    material: proj.material,
+                    total,
+                    done,
+                    pct
+                }
+            }
+        }
+
+        case 'add_task': {
+            const t = addTask(args.title, args.description)
+            const resAdd = {
+                success: true,
+                message: `task added: ${t.title}`,
+                task: { id: t.id, title: t.title, status: t.status }
+            }
+            broadcastState()
+            return resAdd
+        }
+
+        case 'start_next_task': {
+            const res = startNextTask()
+            if (!res.ok) {
+                return {
+                    success: false,
+                    message: `cannot start: ${res.reason}`
+                }
+            }
+            const t = res.task!
+            const resStart = {
+                success: true,
+                message: `started: ${t.title}`,
+                task: {
+                    id: t.id,
+                    title: t.title,
+                    status: t.status
+                }
+            }
+            broadcastState()
+            return resStart
+        }
+
+        case 'complete_active_task': {
+            const res = completeActiveTask()
+            if (!res.ok) {
+                return {
+                    success: false,
+                    message: `cannot complete: ${res.reason}`
+                }
+            }
+            const t = res.task!
+            const resComplete = {
+                success: true,
+                message: `completed: ${t.title}`,
+                task: {
+                    id: t.id,
+                    title: t.title,
+                    status: t.status
+                }
+            }
+            broadcastState()
+            return resComplete
+        }
+
+        default:
+            return { success: false, message: `Unknown tool: ${toolName}` }
+    }
+}
+
+async function processMessage(username: string, message: string) {
+    console.log(`[${username}]: ${message}`)
+
+    conversation.push({ role: 'user', content: `[${username}]: ${message}` })
+    if (conversation.length > 30)
+        conversation.splice(1, conversation.length - 30)
+
+    console.log('conversation: ', JSON.stringify(conversation, null, 2))
+
+    try {
+        const options: OpenAI.Responses.ResponseCreateParamsNonStreaming = {
+            model: 'gpt-5-mini-2025-08-07',
+            input: buildContext(),
+            tools,
+            tool_choice: 'auto',
+            reasoning: { effort: 'low' }
+        }
+
+        const response = await callOpenAIWithLogging(options, 'chat_message')
+
+        const toolCalls: OpenAI.Responses.ResponseFunctionToolCall[] =
+            response.output?.filter((c) => c.type === 'function_call') ?? []
+
+        if (toolCalls.length > 0) {
+            for (const toolCall of toolCalls) {
+                console.log('toolCall: ', JSON.stringify(toolCall, null, 2))
+                const toolName = toolCall.name
+                const args = JSON.parse(toolCall.arguments)
+                const result = await executeMCPTool(toolName, args)
+                console.log(`Tool executed: ${toolName}`, result)
+
+                conversation.push({
+                    role: 'assistant',
+                    content: `Executed tool ${toolName} with result: ${JSON.stringify(result)}`
+                })
+            }
+        }
+
+        const textResponse =
+            response.output
+                ?.filter((c) => c.type === 'message')
+                .map((c) => {
+                    if (typeof c.content === 'string') {
+                        return c.content
+                    } else if (Array.isArray(c.content)) {
+                        return c.content
+                            .map((block) =>
+                                typeof block === 'string'
+                                    ? block
+                                    : (block as any).text
+                            )
+                            .join('\n')
+                    } else {
+                        return JSON.stringify(c.content)
+                    }
+                })
+                .join('\n') ?? ''
+
+        console.log('processMessage: ', JSON.stringify(textResponse, null, 2))
+
+        if (textResponse.trim()) {
+            bot.chat(textResponse)
+            conversation.push({ role: 'assistant', content: textResponse })
+        }
+        // Notify dashboard after chat is processed
+        broadcastState()
+    } catch (error) {
+        console.error('Error processing message:', error)
+        bot.chat('ошибка при обработке сообщения')
+    }
+}
+
+bot.on('chat', (username, message) => {
+    if (username === bot.username) return
+
+    processMessage(username, message)
+})
+
+bot.on('spawn', () => {
+    console.log('Bot spawned!')
+})
+
+bot.on('death', () => {
+    bot.respawn()
+})
+
+bot.on('kicked', (reason) => {
+    console.log('Kicked:', reason)
+})
+
+bot.on('error', (error) => {
+    console.error('Bot error:', error)
+})

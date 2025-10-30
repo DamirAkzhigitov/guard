@@ -1,0 +1,27 @@
+{
+  "name": "untitled",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "test": "vitest",
+    "test:ui": "vitest --ui"
+  },
+  "private": true,
+  "dependencies": {
+    "express": "^5.1.0",
+    "mineflayer": "4.33.0",
+    "mineflayer-movement": "^0.4.4",
+    "openai": "^6.7.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1",
+    "@vitest/ui": "^4.0.4",
+    "prettier": "^3.6.2",
+    "tsx": "^4.20.6",
+    "vitest": "^4.0.4"
+  }
+}
