@@ -2,7 +2,7 @@ import OpenAI from 'openai'
 import { OpenAICallLog } from '../types'
 
 export const openai = new OpenAI({
-    apiKey: ''
+    apiKey: process.env.OPENAI_KEY
 })
 
 const MAX_LOGS = 50

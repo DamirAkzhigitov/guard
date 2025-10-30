@@ -12,7 +12,7 @@ import { callOpenAIWithLogging, setBroadcastStateCallback } from './ai/openai'
 import OpenAI from 'openai'
 
 const bot = createBotInstance({
-    host: 'localhost',
+    host: process.env.HOST,
     port: 25689,
     username: 'Vitalik',
     auth: 'offline'
